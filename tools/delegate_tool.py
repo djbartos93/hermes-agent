@@ -28,6 +28,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from toolsets import TOOLSETS
@@ -633,14 +634,19 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     return None
 
 
-def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
-    """Remove toolsets that contain only blocked tools."""
+def _strip_blocked_tools(toolsets: List[str], *, keep_memory: bool = False) -> List[str]:
+    """Remove toolsets that contain only blocked tools.
+
+    When ``keep_memory`` is True (specialist subagents), the memory toolset
+    is preserved so the specialist can read/write its own MEMORY.md.
+    """
     blocked_toolset_names = {
         "delegation",
         "clarify",
-        "memory",
         "code_execution",
     }
+    if not keep_memory:
+        blocked_toolset_names.add("memory")
     return [t for t in toolsets if t not in blocked_toolset_names]
 
 
@@ -852,6 +858,11 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Optional specialist profile name. When set, child loads
+    # ~/.hermes/profiles/<name>/ (its own SOUL.md and memories/MEMORY.md)
+    # instead of running as an ephemeral throwaway. Missing profile falls
+    # back to ephemeral with a warning.
+    specialist: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -864,6 +875,42 @@ def _build_child_agent(
     """
     from run_agent import AIAgent
     import uuid as _uuid
+
+    # ── Specialist profile resolution ───────────────────────────────────
+    # When specialist is set, resolve it to a Hermes profile under
+    # ~/.hermes/profiles/<name>/.  The child then loads that profile's
+    # SOUL.md (root) and memories/MEMORY.md (memories subdir) instead of
+    # running ephemeral.  Missing/invalid profile degrades to ephemeral so
+    # a typo never crashes delegation.
+    specialist_workspace: Optional[Path] = None
+    if specialist:
+        try:
+            from hermes_cli.profiles import get_profile_dir, profile_exists, validate_profile_name
+            validate_profile_name(specialist)
+            if profile_exists(specialist) and specialist != "default":
+                specialist_workspace = get_profile_dir(specialist)
+                logger.info(
+                    "Delegating to specialist profile: %s (path=%s)",
+                    specialist, specialist_workspace,
+                )
+            else:
+                logger.warning(
+                    "Specialist profile '%s' not found — falling back to ephemeral subagent",
+                    specialist,
+                )
+                specialist = None
+        except ValueError as exc:
+            logger.warning(
+                "Invalid specialist profile name '%s' (%s) — falling back to ephemeral subagent",
+                specialist, exc,
+            )
+            specialist = None
+        except Exception as exc:
+            logger.warning(
+                "Could not resolve specialist profile '%s': %s — falling back to ephemeral subagent",
+                specialist, exc,
+            )
+            specialist = None
 
     # ── Role resolution ─────────────────────────────────────────────────
     # Honor the caller's role only when BOTH the kill switch and the
@@ -906,6 +953,9 @@ def _build_child_agent(
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
+    # Specialists keep the memory toolset so they can read/write their own
+    # workspace-<name>/MEMORY.md. Leaves and orchestrators still strip it.
+    _keep_memory = specialist is not None
     if toolsets:
         # Intersect with parent — subagent must not gain tools the parent lacks
         child_toolsets = [t for t in toolsets if t in parent_toolsets]
@@ -913,13 +963,19 @@ def _build_child_agent(
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
             )
-        child_toolsets = _strip_blocked_tools(child_toolsets)
+        child_toolsets = _strip_blocked_tools(child_toolsets, keep_memory=_keep_memory)
     elif parent_agent and parent_enabled is not None:
-        child_toolsets = _strip_blocked_tools(parent_enabled)
+        child_toolsets = _strip_blocked_tools(parent_enabled, keep_memory=_keep_memory)
     elif parent_toolsets:
-        child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
+        child_toolsets = _strip_blocked_tools(sorted(parent_toolsets), keep_memory=_keep_memory)
     else:
-        child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
+        child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS, keep_memory=_keep_memory)
+
+    # Specialists may need the memory toolset even when the parent doesn't
+    # currently have it loaded (e.g. CLI without memory enabled delegating
+    # to a specialist whose whole point is its own MEMORY.md).
+    if _keep_memory and "memory" not in child_toolsets:
+        child_toolsets.append("memory")
 
     # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
     # removed.  The re-add is unconditional on parent-toolset membership because
@@ -978,12 +1034,47 @@ def _build_child_agent(
 
         child_thinking_cb = _child_thinking
 
-    # Resolve effective credentials: config override > parent inherit
-    effective_model = model or parent_agent.model
-    effective_provider = override_provider or getattr(parent_agent, "provider", None)
-    effective_base_url = override_base_url or parent_agent.base_url
-    effective_api_key = override_api_key or parent_api_key
-    effective_api_mode = override_api_mode or getattr(parent_agent, "api_mode", None)
+    # Specialists load credentials from their own profile config.yaml +
+    # .env — the whole point of a specialist is that it runs with its own
+    # model identity (e.g. local GPU for 'coder' while parent runs on
+    # cloud).  These take precedence over delegation.* overrides and
+    # parent inheritance; fields the profile doesn't set fall through.
+    specialist_creds: Dict[str, Optional[str]] = {
+        "model": None,
+        "provider": None,
+        "base_url": None,
+        "api_key": None,
+        "api_mode": None,
+    }
+    if specialist and specialist_workspace is not None:
+        specialist_creds = _resolve_specialist_credentials(specialist_workspace)
+        logger.info(
+            "Specialist '%s' credentials: model=%s provider=%s base_url=%s api_key_set=%s",
+            specialist,
+            specialist_creds["model"],
+            specialist_creds["provider"],
+            specialist_creds["base_url"],
+            bool(specialist_creds["api_key"]),
+        )
+
+    # Resolve effective credentials: specialist profile > delegation config override > parent inherit
+    effective_model = specialist_creds["model"] or model or parent_agent.model
+    effective_provider = (
+        specialist_creds["provider"]
+        or override_provider
+        or getattr(parent_agent, "provider", None)
+    )
+    effective_base_url = (
+        specialist_creds["base_url"] or override_base_url or parent_agent.base_url
+    )
+    effective_api_key = (
+        specialist_creds["api_key"] or override_api_key or parent_api_key
+    )
+    effective_api_mode = (
+        specialist_creds["api_mode"]
+        or override_api_mode
+        or getattr(parent_agent, "api_mode", None)
+    )
     effective_acp_command = override_acp_command or getattr(
         parent_agent, "acp_command", None
     )
@@ -1026,6 +1117,14 @@ def _build_child_agent(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
+    # Specialists load their own SOUL.md / AGENTS.md / MEMORY.md from the
+    # resolved workspace dir. Ephemeral children keep the original
+    # skip_context_files=True / skip_memory=True defaults.
+    _is_specialist = specialist is not None and specialist_workspace is not None
+    _child_skip_context_files = not _is_specialist
+    _child_skip_memory = not _is_specialist
+    _child_workspace = str(specialist_workspace) if _is_specialist else None
+
     child = AIAgent(
         base_url=effective_base_url,
         api_key=effective_api_key,
@@ -1043,8 +1142,9 @@ def _build_child_agent(
         ephemeral_system_prompt=child_prompt,
         log_prefix=f"[subagent-{task_index}]",
         platform=parent_agent.platform,
-        skip_context_files=True,
-        skip_memory=True,
+        skip_context_files=_child_skip_context_files,
+        skip_memory=_child_skip_memory,
+        workspace=_child_workspace,
         clarify_callback=None,
         thinking_callback=child_thinking_cb,
         session_db=getattr(parent_agent, "_session_db", None),
@@ -1067,6 +1167,8 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    # Record specialist name for introspection/logging (None for ephemeral).
+    child._delegate_specialist = specialist if _is_specialist else None
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
@@ -1818,6 +1920,7 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    specialist: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -1905,7 +2008,13 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [
-            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+            {
+                "goal": goal,
+                "context": context,
+                "toolsets": toolsets,
+                "role": top_role,
+                "specialist": specialist,
+            }
         ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -1942,6 +2051,13 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            # Per-task specialist beats top-level.  Empty/whitespace strings
+            # normalise to None so the ephemeral path kicks in.
+            _raw_specialist = t.get("specialist") if "specialist" in t else specialist
+            effective_specialist = (
+                _raw_specialist.strip() if isinstance(_raw_specialist, str) and _raw_specialist.strip()
+                else None
+            )
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -1964,6 +2080,7 @@ def delegate_task(
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
                 role=effective_role,
+                specialist=effective_specialist,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -1982,7 +2099,22 @@ def delegate_task(
         completed_count = 0
         spinner_ref = getattr(parent_agent, "_delegate_spinner", None)
 
-        with ThreadPoolExecutor(max_workers=max_children) as executor:
+        # Specialists write to a shared MEMORY.md (one per workspace).  If
+        # any task in the batch is a specialist, serialise the whole batch
+        # to prevent concurrent writes stomping on each other.  Mixed
+        # batches (some specialist, some ephemeral) serialise too — the
+        # user can split them into two delegate_task calls if they need
+        # parallelism for the ephemerals.
+        _any_specialist = any(
+            getattr(c, "_delegate_specialist", None) for (_i, _t, c) in children
+        )
+        _effective_workers = 1 if _any_specialist else max_children
+        if _any_specialist:
+            logger.info(
+                "Specialist task in batch — running serial (max_workers=1) to avoid concurrent MEMORY.md writes"
+            )
+
+        with ThreadPoolExecutor(max_workers=_effective_workers) as executor:
             futures = {}
             for i, t, child in children:
                 future = executor.submit(
@@ -2319,6 +2451,81 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     }
 
 
+def _resolve_specialist_credentials(profile_dir: Path) -> Dict[str, Optional[str]]:
+    """Load model/provider/base_url/api_key/api_mode from a specialist profile.
+
+    A specialist is just a Hermes profile, so its config.yaml ``model:``
+    section is the source of truth for which model/provider the subagent
+    runs on.  Without reading this, a ``custom`` local profile silently
+    falls back to the parent's provider — which is the exact bug that made
+    a local-GPU specialist run on the cloud model.
+
+    Returns a dict with None values for any field the profile doesn't
+    specify, so callers can treat it the same shape as
+    ``_resolve_delegation_credentials``.
+    """
+    result: Dict[str, Optional[str]] = {
+        "model": None, "provider": None, "base_url": None,
+        "api_key": None, "api_mode": None,
+    }
+    config_path = profile_dir / "config.yaml"
+    if not config_path.exists():
+        return result
+    try:
+        import yaml
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f) or {}
+    except Exception as exc:
+        logger.warning("Could not load specialist profile config at %s: %s", config_path, exc)
+        return result
+
+    model_cfg = cfg.get("model", {})
+    if isinstance(model_cfg, str):
+        result["model"] = model_cfg
+    elif isinstance(model_cfg, dict):
+        result["model"] = model_cfg.get("default") or model_cfg.get("model")
+        result["provider"] = model_cfg.get("provider") or None
+        result["base_url"] = model_cfg.get("base_url") or None
+        result["api_mode"] = model_cfg.get("api_mode") or None
+        # Inline api_key in config.yaml is unusual but honour it if present
+        result["api_key"] = model_cfg.get("api_key") or None
+
+    # Load provider-specific API key from the profile's .env when the model
+    # config didn't inline one.  Local endpoints (Ollama, custom) typically
+    # don't need a key, so missing is fine.
+    if not result["api_key"]:
+        env_path = profile_dir / ".env"
+        provider = (result["provider"] or "").lower()
+        env_var_for_provider = {
+            "openai": "OPENAI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+            "openrouter": "OPENROUTER_API_KEY",
+            "nous": "NOUS_API_KEY",
+            "gemini": "GEMINI_API_KEY",
+            "google": "GEMINI_API_KEY",
+            "groq": "GROQ_API_KEY",
+            "xai": "XAI_API_KEY",
+            "mistral": "MISTRAL_API_KEY",
+            "together": "TOGETHER_API_KEY",
+            "deepseek": "DEEPSEEK_API_KEY",
+        }
+        target = env_var_for_provider.get(provider)
+        if target and env_path.exists():
+            try:
+                for raw in env_path.read_text(encoding="utf-8").splitlines():
+                    line = raw.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, _, v = line.partition("=")
+                    if k.strip() == target:
+                        result["api_key"] = v.strip().strip('"').strip("'")
+                        break
+            except Exception as exc:
+                logger.debug("Could not scan specialist .env for %s: %s", target, exc)
+
+    return result
+
+
 def _load_config() -> dict:
     """Load delegation config from CLI_CONFIG or persistent config.
 
@@ -2460,6 +2667,10 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "specialist": {
+                            "type": "string",
+                            "description": "Per-task specialist override. Loads ~/.hermes/profiles/{specialist}/ as the subagent's HERMES_HOME.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -2485,6 +2696,16 @@ DELEGATE_TASK_SCHEMA = {
                     "delegation.orchestrator_enabled=false."
                 ),
             },
+            "specialist": {
+                "type": "string",
+                "description": (
+                    "Delegate to a Hermes profile as a named persistent "
+                    "specialist. Loads ~/.hermes/profiles/{specialist}/SOUL.md "
+                    "and memories/MEMORY.md; the specialist may write back "
+                    "to its own MEMORY.md. Missing/invalid profile falls "
+                    "back to an ephemeral subagent with a warning log."
+                ),
+            },
             "acp_command": {
                 "type": "string",
                 "description": (
@@ -2508,6 +2729,102 @@ DELEGATE_TASK_SCHEMA = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Dynamic schema: embed the live list of available specialists
+# ---------------------------------------------------------------------------
+
+def _list_available_specialists() -> List[str]:
+    """Return sorted names of Hermes profiles usable as specialist subagents.
+
+    Each entry in ``~/.hermes/profiles/<name>/`` is a potential specialist;
+    the active profile (and the synthetic 'default' alias) are excluded so
+    the parent never accidentally recurses into itself.  Errors fall back
+    to [] so schema generation never breaks tool loading.
+    """
+    try:
+        from hermes_cli.profiles import _get_profiles_root, _PROFILE_ID_RE, get_active_profile_name
+        profiles_root = _get_profiles_root()
+        if not profiles_root.is_dir():
+            return []
+        try:
+            active = get_active_profile_name() or ""
+        except Exception:
+            active = ""
+        names = []
+        for entry in profiles_root.iterdir():
+            if not entry.is_dir():
+                continue
+            if not _PROFILE_ID_RE.match(entry.name):
+                continue
+            if entry.name == active:
+                continue  # don't self-delegate
+            names.append(entry.name)
+        return sorted(names)
+    except Exception as exc:
+        logger.debug("Could not list specialist profiles: %s", exc)
+        return []
+
+
+def get_dynamic_schema() -> Dict[str, Any]:
+    """Return DELEGATE_TASK_SCHEMA with the live specialist list embedded.
+
+    Called from model_tools.get_tool_definitions() once per session so the
+    model sees the specialist names that actually exist on disk at the
+    moment the tool list is built.  Without this, the static schema only
+    describes the ``specialist`` field structurally and Claude tends to
+    avoid using it because it has no concrete options to choose from.
+    """
+    import copy
+    schema = copy.deepcopy(DELEGATE_TASK_SCHEMA)
+
+    specialists = _list_available_specialists()
+
+    if specialists:
+        specialist_list = ", ".join(f"'{s}'" for s in specialists)
+        top_hint = (
+            "\n\nSPECIALIST DELEGATION: you can delegate to a named persistent "
+            "specialist via the 'specialist' parameter. Each specialist is a "
+            "Hermes profile with its own SOUL.md identity and MEMORY.md that "
+            "accumulates learnings across calls — prefer one over an ephemeral "
+            "subagent when the task matches its domain. "
+            f"Available specialists: {specialist_list}."
+        )
+        prop_hint = (
+            "Name of a Hermes profile to delegate to as a specialist subagent. "
+            "Loads ~/.hermes/profiles/{specialist}/SOUL.md and "
+            "memories/MEMORY.md instead of running ephemeral. "
+            f"Available specialists: {specialist_list}. "
+            "Omit this field for a fresh ephemeral subagent."
+        )
+    else:
+        top_hint = ""  # no point advertising a feature with no options
+        prop_hint = (
+            "Name of a Hermes profile to delegate to as a specialist subagent. "
+            "No other profiles are currently configured — create one via "
+            "'hermes profile create <name>' to register a specialist."
+        )
+
+    schema["description"] = schema.get("description", "") + top_hint
+
+    props = schema.get("parameters", {}).get("properties", {})
+    if "specialist" in props:
+        props["specialist"]["description"] = prop_hint
+
+    task_props = (
+        schema.get("parameters", {})
+        .get("properties", {})
+        .get("tasks", {})
+        .get("items", {})
+        .get("properties", {})
+    )
+    if "specialist" in task_props:
+        task_props["specialist"]["description"] = (
+            "Per-task specialist override. " + prop_hint
+        )
+
+    return schema
+
+
 # --- Registry ---
 from tools.registry import registry, tool_error
 
@@ -2524,6 +2841,7 @@ registry.register(
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         role=args.get("role"),
+        specialist=args.get("specialist"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

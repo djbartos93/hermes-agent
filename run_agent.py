@@ -948,6 +948,7 @@ class AIAgent:
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
+        workspace: Optional[str] = None,
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
@@ -1030,6 +1031,10 @@ class AIAgent:
         self.background_review_callback = None  # Optional sync callback for gateway delivery
         self.skip_context_files = skip_context_files
         self.load_soul_identity = load_soul_identity
+        # Workspace override: when set, SOUL.md / AGENTS.md / MEMORY.md are
+        # loaded from this directory instead of HERMES_HOME and os.getcwd().
+        # Used by specialist subagents spawned via delegate_task(specialist=...).
+        self._workspace_override: Optional[Path] = Path(workspace) if workspace else None
         self.pass_session_id = pass_session_id
         self._credential_pool = credential_pool
         self.log_prefix_chars = log_prefix_chars
@@ -1710,9 +1715,19 @@ class AIAgent:
                 self._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
                 if self._memory_enabled or self._user_profile_enabled:
                     from tools.memory_tool import MemoryStore
+                    # When workspace_override is set (specialist profile), match
+                    # the profile's layout: MEMORY.md/USER.md live in a
+                    # 'memories' subdir, mirroring get_memory_dir() semantics
+                    # under a profile-scoped HERMES_HOME.
+                    _mem_dir = (
+                        self._workspace_override / "memories"
+                        if self._workspace_override is not None
+                        else None
+                    )
                     self._memory_store = MemoryStore(
                         memory_char_limit=mem_config.get("memory_char_limit", 2200),
                         user_char_limit=mem_config.get("user_char_limit", 1375),
+                        memory_dir=_mem_dir,
                     )
                     self._memory_store.load_from_disk()
             except Exception:
@@ -4880,7 +4895,7 @@ class AIAgent:
         # cwd project instructions disabled.
         _soul_loaded = False
         if self.load_soul_identity or not self.skip_context_files:
-            _soul_content = load_soul_md()
+            _soul_content = load_soul_md(base_dir=self._workspace_override)
             if _soul_content:
                 prompt_parts = [_soul_content]
                 _soul_loaded = True
@@ -4995,9 +5010,17 @@ class AIAgent:
             # mode).  The gateway process runs from the hermes-agent install
             # dir, so os.getcwd() would pick up the repo's AGENTS.md and
             # other dev files — inflating token usage by ~10k for no benefit.
-            _context_cwd = os.getenv("TERMINAL_CWD") or None
+            # Workspace override (specialist subagents) wins over both — AGENTS.md
+            # comes from the specialist's own workspace-<name> dir, and SOUL.md
+            # never falls back to HERMES_HOME for specialists.
+            if self._workspace_override is not None:
+                _context_cwd = str(self._workspace_override)
+                _skip_soul = True  # specialist SOUL.md handled above; no HERMES_HOME fallback
+            else:
+                _context_cwd = os.getenv("TERMINAL_CWD") or None
+                _skip_soul = _soul_loaded
             context_files_prompt = build_context_files_prompt(
-                cwd=_context_cwd, skip_soul=_soul_loaded)
+                cwd=_context_cwd, skip_soul=_skip_soul)
             if context_files_prompt:
                 prompt_parts.append(context_files_prompt)
 
@@ -9284,6 +9307,7 @@ class AIAgent:
             acp_command=function_args.get("acp_command"),
             acp_args=function_args.get("acp_args"),
             role=function_args.get("role"),
+            specialist=function_args.get("specialist"),
             parent_agent=self,
         )
 
