@@ -439,6 +439,22 @@ def _compute_tool_definitions(
                         filtered_tools[i] = {"type": "function", "function": dynamic}
                         break
 
+    # Inject the live list of specialist workspaces into delegate_task's
+    # description.  Without this, the model sees the 'specialist' field
+    # structurally but has no concrete names to pick from and falls back
+    # to ephemeral delegation.
+    if "delegate_task" in available_tool_names:
+        try:
+            from tools.delegate_tool import get_dynamic_schema as _delegate_dynamic_schema
+            dynamic = _delegate_dynamic_schema()
+        except Exception:  # pragma: no cover — defensive, fall back to static
+            dynamic = None
+        if dynamic is not None:
+            for i, td in enumerate(filtered_tools):
+                if td.get("function", {}).get("name") == "delegate_task":
+                    filtered_tools[i] = {"type": "function", "function": dynamic}
+                    break
+
     # Strip web tool cross-references from browser_navigate description when
     # web_search / web_extract are not available.  The static schema says
     # "prefer web_search or web_extract" which causes the model to hallucinate
