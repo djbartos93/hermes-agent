@@ -5024,17 +5024,6 @@ class AIAgent:
             if context_files_prompt:
                 prompt_parts.append(context_files_prompt)
 
-        from hermes_time import now as _hermes_now
-        now = _hermes_now()
-        timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')}"
-        if self.pass_session_id and self.session_id:
-            timestamp_line += f"\nSession ID: {self.session_id}"
-        if self.model:
-            timestamp_line += f"\nModel: {self.model}"
-        if self.provider:
-            timestamp_line += f"\nProvider: {self.provider}"
-        prompt_parts.append(timestamp_line)
-
         # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
         # of the requested model. Inject explicit model identity into the system prompt
         # so the agent can correctly report which model it is (workaround for API bug).
@@ -5065,6 +5054,20 @@ class AIAgent:
                     prompt_parts.append(_entry.platform_hint)
             except Exception:
                 pass
+
+        # Dynamic per-turn content goes LAST so the prefix above stays
+        # byte-identical across turns and provider prompt caching can hit.
+        # Anything that changes (timestamp, session ID) must live at the tail.
+        from hermes_time import now as _hermes_now
+        now = _hermes_now()
+        timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')}"
+        if self.pass_session_id and self.session_id:
+            timestamp_line += f"\nSession ID: {self.session_id}"
+        if self.model:
+            timestamp_line += f"\nModel: {self.model}"
+        if self.provider:
+            timestamp_line += f"\nProvider: {self.provider}"
+        prompt_parts.append(timestamp_line)
 
         return "\n\n".join(p.strip() for p in prompt_parts if p.strip())
 
