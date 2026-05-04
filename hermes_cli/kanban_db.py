@@ -699,6 +699,17 @@ def create_task(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
             f"got {workspace_kind!r}"
         )
+    # Reject opt-out assignees up front so kanban_create / CLI / dashboard
+    # inline-create all bounce at the same chokepoint with a clear error,
+    # rather than the orchestrator wedging tasks onto a profile that has
+    # explicitly said "don't route to me." Existing tasks already in the
+    # DB are unaffected — the dispatcher still runs them as assigned.
+    if assignee and not is_kanban_assignable(assignee):
+        raise ValueError(
+            f"profile {assignee!r} has opted out of kanban assignment "
+            f"(kanban.assignable=false in its config.yaml). Pick a "
+            f"different assignee, or flip the flag if this was intentional."
+        )
     parents = tuple(p for p in parents if p)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
@@ -2749,6 +2760,45 @@ def list_profiles_on_disk() -> list[str]:
     return names
 
 
+def is_kanban_assignable(profile_name: Optional[str]) -> bool:
+    """Return True iff ``profile_name`` may be assigned kanban tasks.
+
+    Per-profile opt-out lives in ``~/.hermes/profiles/<name>/config.yaml``::
+
+        kanban:
+          assignable: false
+
+    The flag is opt-out: anything other than an explicit ``false`` (a
+    missing section, missing file, missing key, or unparseable YAML)
+    leaves the profile assignable, so newly-created profiles work
+    without any config edits. Strings ``"false"`` / ``"no"`` / ``"0"``
+    / ``"off"`` are also honored to be friendly to hand-edited configs.
+    """
+    if not profile_name:
+        return True
+    try:
+        cfg_path = Path.home() / ".hermes" / "profiles" / profile_name / "config.yaml"
+    except Exception:
+        return True
+    if not cfg_path.is_file():
+        return True
+    try:
+        import yaml
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except Exception:
+        return True
+    section = cfg.get("kanban")
+    if not isinstance(section, dict):
+        return True
+    val = section.get("assignable")
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() not in ("false", "no", "0", "off")
+    return True
+
+
 def known_assignees(conn: sqlite3.Connection) -> list[dict]:
     """Return every assignee name known to the board or on disk.
 
@@ -2779,6 +2829,12 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
             "name": name,
             "on_disk": name in on_disk,
             "counts": counts.get(name, {}),
+            # Surfaced so the dashboard picker / `hermes kanban assignees`
+            # can grey out or hide profiles that have opted out via
+            # kanban.assignable=false in their config.yaml. Names not on
+            # disk (e.g. tasks pre-existing from a deleted profile) are
+            # treated as assignable so the UI can still show them.
+            "assignable": is_kanban_assignable(name) if name in on_disk else True,
         }
         for name in names
     ]
