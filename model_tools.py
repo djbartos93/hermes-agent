@@ -446,7 +446,7 @@ def _compute_tool_definitions(
     if "delegate_task" in available_tool_names:
         try:
             from tools.delegate_tool import get_dynamic_schema as _delegate_dynamic_schema
-            dynamic = _delegate_dynamic_schema()
+            dynamic = _delegate_dynamic_schema(available_tool_names=available_tool_names)
         except Exception:  # pragma: no cover — defensive, fall back to static
             dynamic = None
         if dynamic is not None:
