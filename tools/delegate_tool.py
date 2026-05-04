@@ -644,6 +644,11 @@ def _strip_blocked_tools(toolsets: List[str], *, keep_memory: bool = False) -> L
         "delegation",
         "clarify",
         "code_execution",
+        # Kanban tools mutate the parent kanban worker's task state. An
+        # in-process child inherits HERMES_KANBAN_TASK from the parent's
+        # env, so without stripping, a child could call kanban_complete
+        # and silently close the parent's task mid-run.
+        "kanban",
     }
     if not keep_memory:
         blocked_toolset_names.add("memory")
@@ -2765,7 +2770,7 @@ def _list_available_specialists() -> List[str]:
         return []
 
 
-def get_dynamic_schema() -> Dict[str, Any]:
+def get_dynamic_schema(available_tool_names: Optional[set] = None) -> Dict[str, Any]:
     """Return DELEGATE_TASK_SCHEMA with the live specialist list embedded.
 
     Called from model_tools.get_tool_definitions() once per session so the
@@ -2773,11 +2778,17 @@ def get_dynamic_schema() -> Dict[str, Any]:
     moment the tool list is built.  Without this, the static schema only
     describes the ``specialist`` field structurally and Claude tends to
     avoid using it because it has no concrete options to choose from.
+
+    When ``available_tool_names`` includes ``kanban_create``, the caller
+    is running as a kanban orchestrator/worker and we additionally nudge
+    them to prefer kanban for async/durable/parallel work — since
+    delegate_task blocks the parent until the child returns.
     """
     import copy
     schema = copy.deepcopy(DELEGATE_TASK_SCHEMA)
 
     specialists = _list_available_specialists()
+    kanban_loaded = bool(available_tool_names and "kanban_create" in available_tool_names)
 
     if specialists:
         specialist_list = ", ".join(f"'{s}'" for s in specialists)
@@ -2803,6 +2814,19 @@ def get_dynamic_schema() -> Dict[str, Any]:
             "No other profiles are currently configured — create one via "
             "'hermes profile create <name>' to register a specialist."
         )
+
+    if kanban_loaded:
+        kanban_hint = (
+            "\n\nKANBAN VS DELEGATE: delegate_task is SYNCHRONOUS — the parent "
+            "blocks until the child returns and the child dies with the "
+            "parent. For work that should run async, survive a parent "
+            "crash, fan out across multiple profiles in parallel, or be "
+            "tracked durably with a structured handoff, prefer "
+            "kanban_create(assignee=<profile>, ...) instead. Use "
+            "delegate_task for inline lookups where you need the answer "
+            "right now to keep reasoning."
+        )
+        top_hint = top_hint + kanban_hint
 
     schema["description"] = schema.get("description", "") + top_hint
 
