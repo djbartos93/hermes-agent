@@ -282,3 +282,155 @@ class TestIntegrationWithModelsModule:
             result = get_curated_nous_model_ids()
 
         assert result == ["anthropic/claude-opus-4.7", "moonshotai/kimi-k2.6"]
+
+
+class TestExtraModels:
+    """User-defined extras file at ``$HERMES_HOME/extra_models.yaml``."""
+
+    def _write_extras(self, home, contents: str) -> None:
+        (home / "extra_models.yaml").write_text(contents)
+
+    def test_missing_file_returns_empty_dict(self, isolated_home):
+        from hermes_cli.model_catalog import load_extra_models
+        assert load_extra_models() == {}
+
+    def test_loads_simple_string_lists(self, isolated_home):
+        from hermes_cli.model_catalog import load_extra_models
+        self._write_extras(
+            isolated_home,
+            "openrouter:\n  - x-ai/grok-4\n  - moonshotai/kimi-k2-0905\n"
+            "nous:\n  - Hermes-4-405B\n",
+        )
+        assert load_extra_models() == {
+            "openrouter": ["x-ai/grok-4", "moonshotai/kimi-k2-0905"],
+            "nous": ["Hermes-4-405B"],
+        }
+
+    def test_accepts_dict_entries_with_id(self, isolated_home):
+        from hermes_cli.model_catalog import load_extra_models
+        self._write_extras(
+            isolated_home,
+            "openrouter:\n"
+            "  - id: x-ai/grok-4\n"
+            "  - some-string/model\n",
+        )
+        assert load_extra_models() == {
+            "openrouter": ["x-ai/grok-4", "some-string/model"],
+        }
+
+    def test_skips_malformed_entries(self, isolated_home):
+        from hermes_cli.model_catalog import load_extra_models
+        self._write_extras(
+            isolated_home,
+            "openrouter:\n  - 42\n  - null\n  - {}\n  - x-ai/grok-4\n",
+        )
+        assert load_extra_models() == {"openrouter": ["x-ai/grok-4"]}
+
+    def test_invalid_yaml_returns_empty(self, isolated_home):
+        from hermes_cli.model_catalog import load_extra_models
+        self._write_extras(isolated_home, "openrouter: [unclosed\n")
+        assert load_extra_models() == {}
+
+    def test_top_level_non_dict_returns_empty(self, isolated_home):
+        from hermes_cli.model_catalog import load_extra_models
+        self._write_extras(isolated_home, "- just\n- a\n- list\n")
+        assert load_extra_models() == {}
+
+    def test_mtime_invalidation_picks_up_edits(self, isolated_home):
+        import os
+        from hermes_cli.model_catalog import load_extra_models
+
+        self._write_extras(isolated_home, "openrouter:\n  - x-ai/grok-4\n")
+        assert load_extra_models() == {"openrouter": ["x-ai/grok-4"]}
+
+        # Bump mtime forward so the cache invalidates regardless of FS resolution.
+        path = isolated_home / "extra_models.yaml"
+        path.write_text("openrouter:\n  - moonshotai/kimi-k2-0905\n")
+        future = time.time() + 10
+        os.utime(path, (future, future))
+
+        assert load_extra_models() == {"openrouter": ["moonshotai/kimi-k2-0905"]}
+
+    def test_openrouter_picker_unions_extras(self, isolated_home):
+        """End-to-end: extras should appear in fetch_openrouter_models output."""
+        from hermes_cli import models, model_catalog
+
+        self._write_extras(isolated_home, "openrouter:\n  - aux/extra-model\n")
+
+        # Reset the openrouter cache so this test runs clean.
+        models._openrouter_catalog_cache = None
+        models._openrouter_catalog_extras_mtime = 0.0
+
+        # Fake the live /v1/models to include both a curated id and the extra.
+        live_payload = {
+            "data": [
+                {
+                    "id": "moonshotai/kimi-k2.6",
+                    "supported_parameters": ["tools"],
+                    "pricing": {"prompt": "0", "completion": "0"},
+                },
+                {
+                    "id": "aux/extra-model",
+                    "supported_parameters": ["tools"],
+                    "pricing": {"prompt": "1", "completion": "1"},
+                },
+            ]
+        }
+
+        class _FakeResp:
+            def __init__(self, payload):
+                self._payload = payload
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def read(self):
+                return json.dumps(self._payload).encode()
+
+        with patch.object(
+            model_catalog, "_fetch_manifest", return_value=_valid_manifest()
+        ):
+            with patch(
+                "urllib.request.urlopen",
+                return_value=_FakeResp(live_payload),
+            ):
+                result = models.fetch_openrouter_models(force_refresh=True)
+
+        ids = [mid for mid, _ in result]
+        assert "aux/extra-model" in ids
+
+    def test_nous_curated_ids_unions_extras(self, isolated_home):
+        from hermes_cli import models, model_catalog
+
+        self._write_extras(isolated_home, "nous:\n  - Hermes-4-Custom\n")
+
+        with patch.object(
+            model_catalog, "_fetch_manifest", return_value=_valid_manifest()
+        ):
+            result = models.get_curated_nous_model_ids()
+
+        assert "Hermes-4-Custom" in result
+        # Curated ids still present.
+        assert "anthropic/claude-opus-4.7" in result
+
+    def test_extras_dedupe_against_curated(self, isolated_home):
+        from hermes_cli import models, model_catalog
+
+        # "moonshotai/kimi-k2.6" already present in the in-repo fallback.
+        self._write_extras(isolated_home, "nous:\n  - moonshotai/kimi-k2.6\n")
+
+        with patch.object(model_catalog, "_fetch_manifest", return_value=None):
+            result = models.get_curated_nous_model_ids()
+
+        assert result.count("moonshotai/kimi-k2.6") == 1
+
+    def test_reset_cache_clears_extras(self, isolated_home):
+        from hermes_cli import model_catalog
+
+        self._write_extras(isolated_home, "openrouter:\n  - x-ai/grok-4\n")
+        model_catalog.load_extra_models()
+        assert model_catalog._extra_models_cache is not None
+
+        model_catalog.reset_cache()
+        assert model_catalog._extra_models_cache is None
+        assert model_catalog._extra_models_cache_mtime == 0.0

@@ -70,6 +70,11 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
 ]
 
 _openrouter_catalog_cache: list[tuple[str, str]] | None = None
+# Tracks the extras-file mtime present when ``_openrouter_catalog_cache``
+# was populated. When the user edits ``extra_models.yaml``, the mtime
+# changes and the cache is invalidated on the next call — no manual
+# ``hermes model --refresh`` needed.
+_openrouter_catalog_extras_mtime: float = 0.0
 
 
 # Fallback Vercel AI Gateway snapshot used when the live catalog is unavailable.
@@ -943,9 +948,19 @@ def fetch_openrouter_models(
     force_refresh: bool = False,
 ) -> list[tuple[str, str]]:
     """Return the curated OpenRouter picker list, refreshed from the live catalog when possible."""
-    global _openrouter_catalog_cache
+    global _openrouter_catalog_cache, _openrouter_catalog_extras_mtime
 
-    if _openrouter_catalog_cache is not None and not force_refresh:
+    try:
+        from hermes_cli.model_catalog import _extra_models_path
+        extras_mtime = _extra_models_path().stat().st_mtime
+    except (OSError, FileNotFoundError):
+        extras_mtime = 0.0
+
+    if (
+        _openrouter_catalog_cache is not None
+        and not force_refresh
+        and extras_mtime == _openrouter_catalog_extras_mtime
+    ):
         return list(_openrouter_catalog_cache)
 
     # Prefer the remotely-hosted catalog manifest; fall back to the in-repo
@@ -959,6 +974,20 @@ def fetch_openrouter_models(
         remote = None
     fallback = list(remote) if remote else list(OPENROUTER_MODELS)
     preferred_ids = [mid for mid, _ in fallback]
+
+    # Union user-defined extras (~/.hermes/extra_models.yaml) onto the
+    # curated list. The live /v1/models filter below still rejects typos
+    # and non-tool-calling models, so extras can't break the picker.
+    try:
+        from hermes_cli.model_catalog import load_extra_models
+        extras = load_extra_models().get("openrouter", [])
+    except Exception:
+        extras = []
+    seen_ids = set(preferred_ids)
+    for mid in extras:
+        if mid and mid not in seen_ids:
+            preferred_ids.append(mid)
+            seen_ids.add(mid)
 
     try:
         req = urllib.request.Request(
@@ -1002,6 +1031,7 @@ def fetch_openrouter_models(
     first_id, _ = curated[0]
     curated[0] = (first_id, "recommended")
     _openrouter_catalog_cache = curated
+    _openrouter_catalog_extras_mtime = extras_mtime
     return list(curated)
 
 
@@ -1023,9 +1053,20 @@ def get_curated_nous_model_ids() -> list[str]:
         remote = get_curated_nous_models()
     except Exception:
         remote = None
-    if remote:
-        return list(remote)
-    return list(_PROVIDER_MODELS.get("nous", []))
+    ids = list(remote) if remote else list(_PROVIDER_MODELS.get("nous", []))
+
+    # Union user-defined extras from ~/.hermes/extra_models.yaml.
+    try:
+        from hermes_cli.model_catalog import load_extra_models
+        extras = load_extra_models().get("nous", [])
+    except Exception:
+        extras = []
+    seen = set(ids)
+    for mid in extras:
+        if mid and mid not in seen:
+            ids.append(mid)
+            seen.add(mid)
+    return ids
 
 
 def _ai_gateway_model_is_free(pricing: Any) -> bool:

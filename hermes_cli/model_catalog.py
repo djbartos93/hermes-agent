@@ -67,6 +67,7 @@ DEFAULT_CATALOG_URL = (
 DEFAULT_TTL_HOURS = 24
 DEFAULT_FETCH_TIMEOUT = 8.0
 SUPPORTED_SCHEMA_VERSION = 1
+EXTRA_MODELS_FILENAME = "extra_models.yaml"
 
 _HERMES_USER_AGENT = f"hermes-cli/{_HERMES_VERSION}"
 
@@ -75,6 +76,11 @@ _HERMES_USER_AGENT = f"hermes-cli/{_HERMES_VERSION}"
 # mtime, so calling code never has to think about this.
 _catalog_cache: dict[str, Any] | None = None
 _catalog_cache_source_mtime: float = 0.0
+
+# In-process cache for ``extra_models.yaml`` keyed by file mtime; reloads
+# automatically when the user edits the file.
+_extra_models_cache: dict[str, list[str]] | None = None
+_extra_models_cache_mtime: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -322,8 +328,95 @@ def get_curated_nous_models() -> list[str] | None:
     return out or None
 
 
+def _extra_models_path() -> Path:
+    """Return ``~/.hermes/extra_models.yaml``. Lazy import so tests can patch home."""
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / EXTRA_MODELS_FILENAME
+
+
+def load_extra_models() -> dict[str, list[str]]:
+    """Return user-defined extra model ids per provider.
+
+    Reads ``$HERMES_HOME/extra_models.yaml`` and unions the listed ids with
+    the curated remote catalog before delivery to the picker. Empty dict on
+    missing or malformed file. Cached in-process; reloaded when the file's
+    mtime changes, so editing the file is picked up on the next call without
+    a process restart.
+
+    File format::
+
+        openrouter:
+          - x-ai/grok-4
+          - moonshotai/kimi-k2-0905
+        nous:
+          - Hermes-4-405B
+
+    Each provider key maps to a list of model ids. Dict entries with an
+    ``id`` field are also accepted for forward-compat. Today only
+    ``openrouter`` and ``nous`` consult this file; entries for other
+    providers are loaded but ignored.
+
+    For openrouter, the live ``/v1/models`` filter still applies — typos
+    and non-tool-calling models are dropped silently, same as the curated
+    list. So your ``extra_models.yaml`` can't break the picker.
+    """
+    global _extra_models_cache, _extra_models_cache_mtime
+
+    path = _extra_models_path()
+    try:
+        mtime = path.stat().st_mtime
+    except (OSError, FileNotFoundError):
+        if _extra_models_cache is not None:
+            _extra_models_cache = None
+            _extra_models_cache_mtime = 0.0
+        return {}
+
+    if _extra_models_cache is not None and mtime == _extra_models_cache_mtime:
+        return _extra_models_cache
+
+    try:
+        import yaml
+        with open(path) as fh:
+            data = yaml.safe_load(fh)
+    except Exception as exc:
+        logger.info("extra_models.yaml load failed (%s): %s", path, exc)
+        _extra_models_cache = {}
+        _extra_models_cache_mtime = mtime
+        return {}
+
+    if not isinstance(data, dict):
+        _extra_models_cache = {}
+        _extra_models_cache_mtime = mtime
+        return {}
+
+    out: dict[str, list[str]] = {}
+    for pname, plist in data.items():
+        if not isinstance(pname, str) or not isinstance(plist, list):
+            continue
+        ids: list[str] = []
+        for entry in plist:
+            mid: str | None = None
+            if isinstance(entry, str):
+                mid = entry.strip()
+            elif isinstance(entry, dict):
+                raw = entry.get("id")
+                if isinstance(raw, str):
+                    mid = raw.strip()
+            if mid:
+                ids.append(mid)
+        if ids:
+            out[pname] = ids
+
+    _extra_models_cache = out
+    _extra_models_cache_mtime = mtime
+    return out
+
+
 def reset_cache() -> None:
-    """Clear the in-process cache. Used by tests and ``hermes model --refresh``."""
+    """Clear the in-process caches. Used by tests and ``hermes model --refresh``."""
     global _catalog_cache, _catalog_cache_source_mtime
+    global _extra_models_cache, _extra_models_cache_mtime
     _catalog_cache = None
     _catalog_cache_source_mtime = 0.0
+    _extra_models_cache = None
+    _extra_models_cache_mtime = 0.0
