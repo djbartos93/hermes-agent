@@ -32,6 +32,7 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _resolve_specialist_credentials,
 )
 
 
@@ -1335,6 +1336,138 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
             MockAgent.call_args[1]["enabled_toolsets"],
             ["web", "browser"],
         )
+
+
+class TestSpecialistCredentialResolution(unittest.TestCase):
+    """Profile-driven credential resolution for specialist subagents.
+
+    Regression: openai-codex (and other OAuth-only providers) used to leave
+    api_key=None because they aren't in the env-var lookup table — the child
+    then fell back to the parent's anthropic key and 403'd at chatgpt.com.
+    """
+
+    def _write_profile(self, tmpdir, model_cfg):
+        import yaml
+        from pathlib import Path
+
+        profile = Path(tmpdir) / "profile"
+        profile.mkdir()
+        (profile / "config.yaml").write_text(yaml.safe_dump({"model": model_cfg}))
+        return profile
+
+    def test_oauth_provider_resolves_via_runtime_provider(self):
+        """openai-codex (no api_key in profile, no env var) falls back to runtime resolver."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = self._write_profile(tmp, {
+                "default": "gpt-5.4",
+                "provider": "openai-codex",
+            })
+
+            fake_runtime = {
+                "provider": "openai-codex",
+                "api_mode": "codex_responses",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_key": "oauth-access-token-xyz",
+            }
+            with patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value=fake_runtime,
+            ) as mock_resolve:
+                creds = _resolve_specialist_credentials(profile)
+
+            mock_resolve.assert_called_once_with(requested="openai-codex")
+            self.assertEqual(creds["api_key"], "oauth-access-token-xyz")
+            self.assertEqual(creds["base_url"], "https://chatgpt.com/backend-api/codex")
+            self.assertEqual(creds["api_mode"], "codex_responses")
+            self.assertEqual(creds["model"], "gpt-5.4")
+            self.assertEqual(creds["provider"], "openai-codex")
+
+    def test_explicit_profile_api_key_wins_over_runtime_resolver(self):
+        """An inline api_key in config.yaml short-circuits the runtime fallback."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = self._write_profile(tmp, {
+                "default": "gpt-5.4",
+                "provider": "openai-codex",
+                "api_key": "profile-explicit-key",
+            })
+
+            with patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider"
+            ) as mock_resolve:
+                creds = _resolve_specialist_credentials(profile)
+
+            mock_resolve.assert_not_called()
+            self.assertEqual(creds["api_key"], "profile-explicit-key")
+
+    def test_profile_base_url_and_api_mode_preserved(self):
+        """When the profile sets base_url/api_mode explicitly, the runtime
+        resolver must not overwrite them — only fill missing fields."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = self._write_profile(tmp, {
+                "default": "gpt-5.4",
+                "provider": "openai-codex",
+                "base_url": "https://my-proxy.example.com/codex",
+                "api_mode": "chat_completions",
+            })
+
+            fake_runtime = {
+                "api_key": "oauth-token",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_mode": "codex_responses",
+            }
+            with patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value=fake_runtime,
+            ):
+                creds = _resolve_specialist_credentials(profile)
+
+            self.assertEqual(creds["api_key"], "oauth-token")
+            self.assertEqual(creds["base_url"], "https://my-proxy.example.com/codex")
+            self.assertEqual(creds["api_mode"], "chat_completions")
+
+    def test_runtime_resolver_failure_is_non_fatal(self):
+        """If runtime resolution raises (e.g. user not logged in), the
+        function returns api_key=None instead of bubbling the exception —
+        the caller decides how to handle missing creds."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = self._write_profile(tmp, {
+                "default": "gpt-5.4",
+                "provider": "openai-codex",
+            })
+
+            with patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                side_effect=Exception("not logged in"),
+            ):
+                creds = _resolve_specialist_credentials(profile)
+
+            self.assertIsNone(creds["api_key"])
+            self.assertEqual(creds["provider"], "openai-codex")
+
+    def test_no_provider_skips_runtime_resolution(self):
+        """When the profile doesn't set a provider at all, don't call the
+        resolver — local/Ollama-style profiles must stay key-less."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = self._write_profile(tmp, {"default": "llama-3"})
+
+            with patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider"
+            ) as mock_resolve:
+                creds = _resolve_specialist_credentials(profile)
+
+            mock_resolve.assert_not_called()
+            self.assertIsNone(creds["api_key"])
+            self.assertIsNone(creds["provider"])
 
 
 class TestChildCredentialLeasing(unittest.TestCase):

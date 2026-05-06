@@ -2563,9 +2563,9 @@ def _resolve_specialist_credentials(profile_dir: Path) -> Dict[str, Optional[str
     # Load provider-specific API key from the profile's .env when the model
     # config didn't inline one.  Local endpoints (Ollama, custom) typically
     # don't need a key, so missing is fine.
+    provider = (result["provider"] or "").lower()
     if not result["api_key"]:
         env_path = profile_dir / ".env"
-        provider = (result["provider"] or "").lower()
         env_var_for_provider = {
             "openai": "OPENAI_API_KEY",
             "anthropic": "ANTHROPIC_API_KEY",
@@ -2592,6 +2592,34 @@ def _resolve_specialist_credentials(profile_dir: Path) -> Dict[str, Optional[str
                         break
             except Exception as exc:
                 logger.debug("Could not scan specialist .env for %s: %s", target, exc)
+
+    # OAuth providers (openai-codex, nous, qwen-oauth, copilot, gemini-oauth, …)
+    # don't store credentials as env-var API keys — their tokens live in
+    # ~/.hermes/auth.json and are loaded via resolve_runtime_provider().  Without
+    # this fallback, a specialist with `provider: openai-codex` ends up with
+    # api_key=None, the effective_api_key resolver falls through to the parent's
+    # anthropic key, and the child hits chatgpt.com/backend-api/codex with the
+    # wrong bearer token → Cloudflare 403.  Same path _resolve_delegation_credentials
+    # already uses; mirroring it here keeps specialist + delegation behavior
+    # consistent.
+    if provider and not result["api_key"]:
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            runtime = resolve_runtime_provider(requested=provider)
+            resolved_key = (runtime.get("api_key") or "").strip()
+            if resolved_key:
+                result["api_key"] = resolved_key
+                if not result["base_url"]:
+                    result["base_url"] = runtime.get("base_url") or None
+                if not result["api_mode"]:
+                    result["api_mode"] = runtime.get("api_mode") or None
+        except Exception as exc:
+            logger.debug(
+                "Could not resolve runtime credentials for specialist provider '%s': %s",
+                provider,
+                exc,
+            )
 
     return result
 
